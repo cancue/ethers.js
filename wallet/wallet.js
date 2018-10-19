@@ -371,6 +371,31 @@ utils.defineProperty(Wallet.prototype, 'encrypt', function(password, options, pr
     return secretStorage.encrypt(this.privateKey, password, options, progressCallback);
 });
 
+utils.defineProperty(Wallet.prototype, 'RNencrypt', function(password, options, progressCallback) {
+    if (typeof(options) === 'function' && !progressCallback) {
+        progressCallback = options;
+        options = {};
+    }
+
+    if (progressCallback && typeof(progressCallback) !== 'function') {
+        throw new Error('invalid callback');
+    }
+
+    if (!options) { options = {}; }
+
+    if (this.mnemonic) {
+        // Make sure we don't accidentally bubble the mnemonic up the call-stack
+        var safeOptions = {};
+        for (var key in options) { safeOptions[key] = options[key]; }
+        options = safeOptions;
+
+        // Set the mnemonic and path
+        options.mnemonic = this.mnemonic;
+        options.path = this.path
+    }
+
+    return secretStorage.RNencrypt(this.privateKey, password, options, progressCallback);
+});
 
 utils.defineProperty(Wallet, 'isEncryptedWallet', function(json) {
     return (secretStorage.isValidWallet(json) || secretStorage.isCrowdsaleWallet(json));
@@ -439,6 +464,39 @@ utils.defineProperty(Wallet, 'fromMnemonic', function(mnemonic, path) {
     return wallet;
 });
 
+utils.defineProperty(Wallet, 'RNfromEncryptedWallet', function(json, password, progressCallback) {
+    if (progressCallback && typeof(progressCallback) !== 'function') {
+        throw new Error('invalid callback');
+    }
+
+    return new Promise(function(resolve, reject) {
+
+        if (secretStorage.isCrowdsaleWallet(json)) {
+            try {
+                var privateKey = secretStorage.decryptCrowdsale(json, password);
+                resolve(new Wallet(privateKey));
+            } catch (error) {
+                reject(error);
+            }
+
+        } else if (secretStorage.isValidWallet(json)) {
+
+            secretStorage.RNdecrypt(json, password, progressCallback).then(function(signingKey) {
+                var wallet = new Wallet(signingKey);
+                if (signingKey.mnemonic && signingKey.path) {
+                    utils.defineProperty(wallet, 'mnemonic', signingKey.mnemonic);
+                    utils.defineProperty(wallet, 'path', signingKey.path);
+                }
+                resolve(wallet);
+            }, function(error) {
+                reject(error);
+            });
+
+        } else {
+            reject('invalid wallet JSON');
+        }
+    });
+});
 
 utils.defineProperty(Wallet, 'fromBrainWallet', function(username, password, progressCallback) {
     if (progressCallback && typeof(progressCallback) !== 'function') {

@@ -2,6 +2,7 @@
 
 var aes = require('aes-js');
 var scrypt = require('scrypt-js');
+var RNscrypt = require('react-native-scrypt');
 var uuid = require('uuid');
 
 var hmac = require('../utils/hmac');
@@ -395,7 +396,7 @@ utils.defineProperty(secretStorage, 'encrypt', function(privateKey, password, op
                     address: address.substring(2).toLowerCase(),
                     id: uuid.v4({ random: uuidRandom }),
                     version: 3,
-                    Crypto: {
+                    crypto: {
                         cipher: 'aes-128-ctr',
                         cipherparams: {
                             iv: utils.hexlify(iv).substring(2),
@@ -443,6 +444,293 @@ utils.defineProperty(secretStorage, 'encrypt', function(privateKey, password, op
                 return progressCallback(progress);
             }
         });
+    });
+});
+
+utils.defineProperty(secretStorage, 'RNdecrypt', function(json, password, progressCallback) {
+    var data = JSON.parse(json);
+
+    var decrypt = function(key, ciphertext) {
+        var cipher = searchPath(data, 'crypto/cipher');
+        if (cipher === 'aes-128-ctr') {
+            var iv = arrayify(searchPath(data, 'crypto/cipherparams/iv'), 'crypto/cipherparams/iv')
+            var counter = new aes.Counter(iv);
+
+            var aesCtr = new aes.ModeOfOperation.ctr(key, counter);
+
+            return arrayify(aesCtr.decrypt(ciphertext));
+        }
+
+        return null;
+    };
+
+    var computeMAC = function(derivedHalf, ciphertext) {
+        return utils.keccak256(utils.concat([derivedHalf, ciphertext]));
+    }
+
+    var getSigningKey = function(key, reject) {
+        var ciphertext = arrayify(searchPath(data, 'crypto/ciphertext'));
+
+        var computedMAC = utils.hexlify(computeMAC(key.slice(16, 32), ciphertext)).substring(2);
+        if (computedMAC !== searchPath(data, 'crypto/mac').toLowerCase()) {
+            reject(new Error('invalid password'));
+            return null;
+        }
+
+        var privateKey = decrypt(key.slice(0, 16), ciphertext);
+        var mnemonicKey = key.slice(32, 64);
+
+        if (!privateKey) {
+            reject(new Error('unsupported cipher'));
+            return null;
+        }
+
+        var signingKey = new SigningKey(privateKey);
+        if (signingKey.address !== utils.getAddress(data.address)) {
+            reject(new Error('address mismatch'));
+            return null;
+        }
+
+        // Version 0.1 x-ethers metadata must contain an encrypted mnemonic phrase
+        if (searchPath(data, 'x-ethers/version') === '0.1') {
+            var mnemonicCiphertext = arrayify(searchPath(data, 'x-ethers/mnemonicCiphertext'), 'x-ethers/mnemonicCiphertext');
+            var mnemonicIv = arrayify(searchPath(data, 'x-ethers/mnemonicCounter'), 'x-ethers/mnemonicCounter');
+
+            var mnemonicCounter = new aes.Counter(mnemonicIv);
+            var mnemonicAesCtr = new aes.ModeOfOperation.ctr(mnemonicKey, mnemonicCounter);
+
+            var path = searchPath(data, 'x-ethers/path') || defaultPath;
+
+            var entropy = arrayify(mnemonicAesCtr.decrypt(mnemonicCiphertext));
+            var mnemonic = HDNode.entropyToMnemonic(entropy);
+
+            if (HDNode.fromMnemonic(mnemonic).derivePath(path).privateKey != utils.hexlify(privateKey)) {
+                reject(new Error('mnemonic mismatch'));
+                return null;
+            }
+
+            signingKey.mnemonic = mnemonic;
+            signingKey.path = path;
+        }
+
+        return signingKey;
+    }
+
+
+    return new Promise(function(resolve, reject) {
+        var kdf = searchPath(data, 'crypto/kdf');
+        if (kdf && typeof(kdf) === 'string') {
+            if (kdf.toLowerCase() === 'scrypt') {
+                var salt = arrayify(searchPath(data, 'crypto/kdfparams/salt'), 'crypto/kdfparams/salt');
+                var N = parseInt(searchPath(data, 'crypto/kdfparams/n'));
+                var r = parseInt(searchPath(data, 'crypto/kdfparams/r'));
+                var p = parseInt(searchPath(data, 'crypto/kdfparams/p'));
+                if (!N || !r || !p) {
+                    reject(new Error('unsupported key-derivation function parameters'));
+                    return;
+                }
+
+                // Make sure N is a power of 2
+                if ((N & (N - 1)) !== 0) {
+                    reject(new Error('unsupported key-derivation function parameter value for N'));
+                    return;
+                }
+
+                var dkLen = parseInt(searchPath(data, 'crypto/kdfparams/dklen'));
+                if (dkLen !== 32) {
+                    reject( new Error('unsupported key-derivation derived-key length'));
+                    return;
+                }
+
+                var RNsalt = Object.values(salt).filter(v => Number.isInteger(v));
+                const result = RNscrypt(password, RNsalt, N, r, p, 64);
+                result.then(key => {
+                    key = arrayify(key);
+
+                    var signingKey = getSigningKey(key, reject);
+                    if (!signingKey) { return; }
+
+                    if (progressCallback) { progressCallback(1); }
+                    resolve(signingKey);
+                });
+                result.catch(error => {
+                    reject(error);
+                });
+
+
+            } else if (kdf.toLowerCase() === 'pbkdf2') {
+                var salt = arrayify(searchPath(data, 'crypto/kdfparams/salt'), 'crypto/kdfparams/salt');
+
+                var prfFunc = null;
+                var prf = searchPath(data, 'crypto/kdfparams/prf');
+                if (prf === 'hmac-sha256') {
+                    prfFunc = hmac.createSha256Hmac;
+                } else if (prf === 'hmac-sha512') {
+                    prfFunc = hmac.createSha512Hmac;
+                } else {
+                    reject(new Error('unsupported prf'));
+                    return;
+                }
+
+                var c = parseInt(searchPath(data, 'crypto/kdfparams/c'));
+
+                var dkLen = parseInt(searchPath(data, 'crypto/kdfparams/dklen'));
+                if (dkLen !== 32) {
+                    reject( new Error('unsupported key-derivation derived-key length'));
+                    return;
+                }
+
+                var key = pbkdf2(getPassword(password), salt, c, dkLen, prfFunc);
+
+                var signingKey = getSigningKey(key, reject);
+                if (!signingKey) { return; }
+
+                resolve(signingKey);
+
+            } else {
+                reject(new Error('unsupported key-derivation function'));
+            }
+
+        } else {
+            reject(new Error('unsupported key-derivation function'));
+        }
+    });
+});
+
+utils.defineProperty(secretStorage, 'RNencrypt', function(privateKey, password, options, progressCallback) {
+
+    // the options are optional, so adjust the call as needed
+    if (typeof(options) === 'function' && !progressCallback) {
+        progressCallback = options;
+        options = {};
+    }
+    if (!options) { options = {}; }
+
+    // Check the private key
+    if (privateKey instanceof SigningKey) {
+        privateKey = privateKey.privateKey;
+    }
+    privateKey = arrayify(privateKey, 'private key');
+    if (privateKey.length !== 32) { throw new Error('invalid private key'); }
+
+    var entropy = options.entropy;
+    if (options.mnemonic) {
+        if (entropy) {
+            if (HDNode.entropyToMnemonic(entropy) !== options.mnemonic) {
+                throw new Error('entropy and mnemonic mismatch');
+            }
+        } else {
+            entropy = HDNode.mnemonicToEntropy(options.mnemonic);
+        }
+    }
+    if (entropy) {
+        entropy = arrayify(entropy, 'entropy');
+    }
+
+    var path = options.path;
+    if (entropy && !path) {
+        path = defaultPath;
+    }
+
+    var client = options.client;
+    if (!client) { client = "ethers.js"; }
+
+    // Check/generate the salt
+    var salt = options.salt;
+    if (salt) {
+        salt = arrayify(salt, 'salt');
+    } else {
+        salt = utils.randomBytes(32);;
+    }
+
+    // Override initialization vector
+    var iv = null;
+    if (options.iv) {
+        iv = arrayify(options.iv, 'iv');
+        if (iv.length !== 16) { throw new Error('invalid iv'); }
+    } else {
+       iv = utils.randomBytes(16);
+    }
+
+    // Override the uuid
+    var uuidRandom = options.uuid;
+    if (uuidRandom) {
+        uuidRandom = arrayify(uuidRandom, 'uuid');
+        if (uuidRandom.length !== 16) { throw new Error('invalid uuid'); }
+    } else {
+        uuidRandom = utils.randomBytes(16);
+    }
+
+    // Override the scrypt password-based key derivation function parameters
+    var N = (1 << 17), r = 8, p = 1;
+    if (options.scrypt) {
+        if (options.scrypt.N) { N = options.scrypt.N; }
+        if (options.scrypt.r) { r = options.scrypt.r; }
+        if (options.scrypt.p) { p = options.scrypt.p; }
+    }
+
+    return new Promise(function(resolve, reject) {
+
+        // We take 64 bytes:
+        //   - 32 bytes   As normal for the Web3 secret storage (derivedKey, macPrefix)
+        //   - 32 bytes   AES key to encrypt mnemonic with (required here to be Ethers Wallet)
+        var RNsalt = Object.values(salt).filter(v => Number.isInteger(v));
+        const result = RNscrypt(password, RNsalt, N, r, p, 64);
+        result.then(key => {
+            if (key) {
+                key = arrayify(key);
+
+                // This will be used to encrypt the wallet (as per Web3 secret storage)
+                var derivedKey = key.slice(0, 16);
+                var macPrefix = key.slice(16, 32);
+
+                // This will be used to encrypt the mnemonic phrase (if any)
+                var mnemonicKey = key.slice(32, 64);
+
+                // Get the address for this private key
+                var address = (new SigningKey(privateKey)).address;
+
+                // Encrypt the private key
+                var counter = new aes.Counter(iv);
+                var aesCtr = new aes.ModeOfOperation.ctr(derivedKey, counter);
+                var ciphertext = utils.arrayify(aesCtr.encrypt(privateKey));
+
+                // Compute the message authentication code, used to check the password
+                var mac = utils.keccak256(utils.concat([macPrefix, ciphertext]))
+
+                // See: https://github.com/ethereum/wiki/wiki/Web3-Secret-Storage-Definition
+                var data = {
+                    address: address.substring(2).toLowerCase(),
+                    id: uuid.v4({ random: uuidRandom }),
+                    version: 3,
+                    crypto: {
+                        cipher: 'aes-128-ctr',
+                        cipherparams: {
+                            iv: utils.hexlify(iv).substring(2),
+                        },
+                        ciphertext: utils.hexlify(ciphertext).substring(2),
+                        kdf: 'scrypt',
+                        kdfparams: {
+                            salt: utils.hexlify(salt).substring(2),
+                            n: N,
+                            dklen: 32,
+                            p: p,
+                            r: r
+                        },
+                        mac: mac.substring(2)
+                    }
+                };
+                if (progressCallback) { progressCallback(1); }
+                resolve(JSON.stringify(data));
+
+            } else if (progressCallback) {
+                return progressCallback();
+            }
+        });
+        result.catch (error => {
+            reject(error);
+        });
+
     });
 });
 

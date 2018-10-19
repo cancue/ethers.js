@@ -2,7 +2,7 @@
 
 var aes = require('aes-js');
 var scrypt = require('scrypt-js');
-var RNscrypt = require('react-native-scrypt');
+import RNscrypt from 'react-native-scrypt';
 var uuid = require('uuid');
 
 var hmac = require('../utils/hmac');

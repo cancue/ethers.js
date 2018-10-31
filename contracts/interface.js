@@ -397,6 +397,7 @@ utils.defineProperty(Interface.prototype, 'parseTransaction', function(tx) {
         if (func.sighash === sighash) {
             var result = utils.coder.decode(func.inputs.types, '0x' + tx.data.substring(10));
             return {
+                inputs: func.inputs,
                 args: result,
                 signature: func.signature,
                 sighash: func.sighash,
